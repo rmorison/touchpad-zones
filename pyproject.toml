@@ -1,0 +1,52 @@
+[project]
+name = "touchpad-zones"
+version = "0.1.0"
+description = "Touchpad dead-zone daemon for large touchpads with built-in disable-while-typing"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+classifiers = [
+    "Operating System :: POSIX :: Linux",
+    "Environment :: No Input/Output (Daemon)",
+    "Topic :: Desktop Environment",
+]
+
+dependencies = [
+    "evdev>=1.6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6.0",
+    "pre-commit>=3.6.0",
+]
+
+[project.scripts]
+touchpad-zones = "touchpad_zones.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort (import sorting)
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "SIM",    # flake8-simplify
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
