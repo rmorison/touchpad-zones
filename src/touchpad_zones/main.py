@@ -28,6 +28,17 @@ import time
 import evdev
 from evdev import UInput, ecodes
 
+# BTN_TOOL_* codes indexed by finger count (1-5)
+_BTN_TOOL_BY_COUNT = [
+    None,  # 0 fingers — not used
+    ecodes.BTN_TOOL_FINGER,
+    ecodes.BTN_TOOL_DOUBLETAP,
+    ecodes.BTN_TOOL_TRIPLETAP,
+    ecodes.BTN_TOOL_QUADTAP,
+    ecodes.BTN_TOOL_QUINTTAP,
+]
+_BTN_TOOL_SET = set(_BTN_TOOL_BY_COUNT[1:])
+
 
 def find_touchpad() -> str | None:
     for path in evdev.list_devices():
@@ -67,7 +78,7 @@ def create_virtual_device(real_dev: evdev.InputDevice) -> UInput:
     )
 
 
-def disable_dwt_on_device(device_name: str) -> None:
+def xinput_set_prop(device_name: str, prop: str, value: str) -> None:
     try:
         xid = subprocess.check_output(
             ["xinput", "list", "--id-only", device_name],
@@ -75,13 +86,46 @@ def disable_dwt_on_device(device_name: str) -> None:
             stderr=subprocess.DEVNULL,
         ).strip()
         subprocess.run(
-            ["xinput", "set-prop", xid, "libinput Disable While Typing Enabled", "0"],
+            ["xinput", "set-prop", xid, prop, value],
             check=True,
             capture_output=True,
         )
-        print(f"Disabled DWT on {device_name} (xinput id {xid})")
+        print(f"Set {prop}={value} on {device_name} (xinput id {xid})")
     except Exception as e:
-        print(f"Warning: could not disable DWT: {e}")
+        print(f"Warning: could not set {prop}: {e}")
+
+
+def xinput_disable(device_name: str) -> None:
+    try:
+        xid = subprocess.check_output(
+            ["xinput", "list", "--id-only", device_name],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        subprocess.run(
+            ["xinput", "disable", xid],
+            check=True,
+            capture_output=True,
+        )
+        print(f"Disabled {device_name} in X (xinput id {xid})")
+    except Exception as e:
+        print(f"Warning: could not disable {device_name}: {e}")
+
+
+def xinput_toggle(device_name: str) -> None:
+    """Disable then re-enable a device in X to force re-read."""
+    try:
+        xid = subprocess.check_output(
+            ["xinput", "list", "--id-only", device_name],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        subprocess.run(["xinput", "disable", xid], check=True, capture_output=True)
+        time.sleep(0.1)
+        subprocess.run(["xinput", "enable", xid], check=True, capture_output=True)
+        print(f"Toggled {device_name} in X (xinput id {xid})")
+    except Exception as e:
+        print(f"Warning: could not toggle {device_name}: {e}")
 
 
 # Modifier and function keys that should NOT trigger DWT
@@ -206,11 +250,31 @@ def main() -> None:
     print("Grabbed real device.")
 
     time.sleep(0.5)
-    disable_dwt_on_device(virt.name)
+    xinput_disable(dev.name)
+    xinput_set_prop(virt.name, "libinput Disable While Typing Enabled", "0")
     print("Running... (Ctrl+C or SIGTERM to stop)")
 
     def in_active_zone(x: int, y: int) -> bool:
         return dead_left <= x <= dead_right and dead_top <= y <= dead_bottom
+
+    def rewrite_btn_tool(
+        batch: list[evdev.InputEvent], finger_count: int
+    ) -> list[evdev.InputEvent]:
+        """Rewrite BTN_TOOL_* events so the reported finger count matches finger_count."""
+        # Grab timestamp from any event in the batch for the injected events
+        ts_sec = batch[0].sec if batch else 0
+        ts_usec = batch[0].usec if batch else 0
+        out: list[evdev.InputEvent] = []
+        for ev in batch:
+            if ev.type == ecodes.EV_KEY and ev.code in _BTN_TOOL_SET:
+                continue  # strip original BTN_TOOL_* events
+            out.append(ev)
+        # Always inject all BTN_TOOL_* with correct state
+        clamped = max(0, min(finger_count, 5))
+        for i in range(1, 6):
+            val = 1 if i == clamped else 0
+            out.append(evdev.InputEvent(ts_sec, ts_usec, ecodes.EV_KEY, _BTN_TOOL_BY_COUNT[i], val))
+        return out
 
     # Touchpad state
     slot_pos: dict[int, tuple[int, int]] = {}
@@ -221,6 +285,11 @@ def main() -> None:
 
     # DWT state
     last_key_time = 0.0
+
+    # Idle-wake: toggle xinput after gaps (lock screen, suspend)
+    # CLOCK_BOOTTIME counts suspend time unlike monotonic
+    last_touch_time = 0.0
+    IDLE_THRESHOLD = 30.0  # seconds
 
     def is_typing() -> bool:
         return (time.monotonic() - last_key_time) < args.dwt_timeout
@@ -238,7 +307,8 @@ def main() -> None:
             virt.write(ecodes.EV_ABS, ecodes.ABS_MT_SLOT, slot)
             virt.write(ecodes.EV_ABS, ecodes.ABS_MT_TRACKING_ID, -1)
         virt.write(ecodes.EV_KEY, ecodes.BTN_TOUCH, 0)
-        virt.write(ecodes.EV_KEY, ecodes.BTN_TOOL_FINGER, 0)
+        for code in _BTN_TOOL_SET:
+            virt.write(ecodes.EV_KEY, code, 0)
         virt.syn()
 
     def cleanup(*_args: object) -> None:
@@ -249,8 +319,13 @@ def main() -> None:
         print("\nClean shutdown.")
         sys.exit(0)
 
+    def toggle_virt(*_args: object) -> None:
+        xinput_toggle(virt.name)
+        print("SIGUSR1: toggled virtual device")
+
     signal.signal(signal.SIGTERM, cleanup)
     signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGUSR1, toggle_virt)
 
     pid_file = os.path.expanduser("~/.touchpad-zones.pid")
     with open(pid_file, "w") as f:
@@ -347,17 +422,41 @@ def main() -> None:
                         any_active = any(not d for d in slot_dead.values())
                         no_slots = len(slot_dead) == 0
 
+                        # Idle-wake: toggle xinput to force X to re-read
+                        # the virtual device after lock screen / suspend
+                        now = time.clock_gettime(time.CLOCK_BOOTTIME)
+                        idle_gap = now - last_touch_time if last_touch_time else 0
+                        if last_touch_time and idle_gap > IDLE_THRESHOLD:
+                            xinput_toggle(virt.name)
+                            if args.verbose:
+                                print(f"  WAKE: toggled after {idle_gap:.0f}s idle")
+                        last_touch_time = now
+
                         # DWT: suppress everything during typing
                         if is_typing() and not touch_forwarded:
                             if args.verbose and any_active:
                                 print("  [DWT suppressed]")
                             batch = []
+                            # Clear slot state so touches that started during
+                            # DWT cannot leak through when DWT expires without
+                            # their tracking IDs (which were in suppressed
+                            # batches). Forces a clean re-land after typing.
+                            slot_pos.clear()
+                            slot_dead.clear()
+                            current_slot = 0
                             continue
+
+                        total_count = len(slot_dead)
 
                         if any_active:
                             for ev in batch:
                                 virt.write_event(ev)
                             virt.syn()
+                            if args.verbose and not touch_forwarded:
+                                print(
+                                    f"  >> FORWARD START: {len(batch)} events, "
+                                    f"{total_count} fingers"
+                                )
                             touch_forwarded = True
                         elif touch_forwarded:
                             for ev in batch:
@@ -365,6 +464,8 @@ def main() -> None:
                             virt.syn()
                             if no_slots:
                                 touch_forwarded = False
+                                if args.verbose:
+                                    print("  >> FORWARD END: all fingers lifted")
                         elif not no_slots:
                             if args.verbose:
                                 print("  [suppressed]")
