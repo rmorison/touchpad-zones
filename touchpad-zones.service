@@ -1,11 +1,11 @@
 [Unit]
-Description=Touchpad dead-zone daemon (disable outer 15%% left/right)
+Description=Touchpad dead-zone daemon (disable outer 20%% left/right)
 After=graphical-session.target
 
 [Service]
 Type=simple
 Environment=PYTHONUNBUFFERED=1
-ExecStart=%h/Projects/github.com/rmorison/touchpad-zones/.venv/bin/touchpad-zones --left 15 --right 15 --verbose
+ExecStart=%h/Projects/github.com/rmorison/touchpad-zones/.venv/bin/touchpad-zones --left 20 --right 20 --verbose
 Restart=on-failure
 RestartSec=5
 

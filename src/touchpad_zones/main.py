@@ -121,7 +121,7 @@ def xinput_toggle(device_name: str) -> None:
             stderr=subprocess.DEVNULL,
         ).strip()
         subprocess.run(["xinput", "disable", xid], check=True, capture_output=True)
-        time.sleep(0.1)
+        time.sleep(0.3)
         subprocess.run(["xinput", "enable", xid], check=True, capture_output=True)
         print(f"Toggled {device_name} in X (xinput id {xid})")
     except Exception as e:
@@ -182,8 +182,8 @@ def main() -> None:
         description="Touchpad dead-zone daemon with built-in DWT",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--left", type=float, default=15, help="Left dead zone %%")
-    parser.add_argument("--right", type=float, default=15, help="Right dead zone %%")
+    parser.add_argument("--left", type=float, default=20, help="Left dead zone %%")
+    parser.add_argument("--right", type=float, default=20, help="Right dead zone %%")
     parser.add_argument("--top", type=float, default=0, help="Top dead zone %%")
     parser.add_argument("--bottom", type=float, default=0, help="Bottom dead zone %%")
     parser.add_argument(
@@ -279,6 +279,7 @@ def main() -> None:
     # Touchpad state
     slot_pos: dict[int, tuple[int, int]] = {}
     slot_dead: dict[int, bool | None] = {}
+    slot_tid: dict[int, int] = {}  # slot -> real tracking ID
     current_slot = 0
     touch_forwarded = False
     batch: list[evdev.InputEvent] = []
@@ -298,6 +299,7 @@ def main() -> None:
         nonlocal current_slot, touch_forwarded
         slot_pos.clear()
         slot_dead.clear()
+        slot_tid.clear()
         current_slot = 0
         touch_forwarded = False
 
@@ -391,6 +393,7 @@ def main() -> None:
                     ):
                         slot_pos.clear()
                         slot_dead.clear()
+                        slot_tid.clear()
                         current_slot = 0
 
                     # Track positions and finger up/down
@@ -404,9 +407,11 @@ def main() -> None:
                         elif event.code == ecodes.ABS_MT_TRACKING_ID:
                             if event.value >= 0:
                                 slot_dead[current_slot] = None
+                                slot_tid[current_slot] = event.value
                             else:
                                 slot_dead.pop(current_slot, None)
                                 slot_pos.pop(current_slot, None)
+                                slot_tid.pop(current_slot, None)
 
                     # Process at SYN_REPORT
                     if event.type == ecodes.EV_SYN and event.code == ecodes.SYN_REPORT:
@@ -422,11 +427,16 @@ def main() -> None:
                         any_active = any(not d for d in slot_dead.values())
                         no_slots = len(slot_dead) == 0
 
-                        # Idle-wake: toggle xinput to force X to re-read
-                        # the virtual device after lock screen / suspend
+                        # Idle-wake: xinput toggle to force X to re-read
+                        # the virtual device after lock / suspend.
+                        # Synthetic lift cleans up stale virtual-device state
+                        # but we do NOT skip this batch — let the touch land.
                         now = time.clock_gettime(time.CLOCK_BOOTTIME)
                         idle_gap = now - last_touch_time if last_touch_time else 0
                         if last_touch_time and idle_gap > IDLE_THRESHOLD:
+                            if touch_forwarded:
+                                synthetic_lift()
+                                touch_forwarded = False
                             xinput_toggle(virt.name)
                             if args.verbose:
                                 print(f"  WAKE: toggled after {idle_gap:.0f}s idle")
@@ -443,21 +453,54 @@ def main() -> None:
                             # batches). Forces a clean re-land after typing.
                             slot_pos.clear()
                             slot_dead.clear()
+                            slot_tid.clear()
                             current_slot = 0
                             continue
 
                         total_count = len(slot_dead)
 
                         if any_active:
+                            if not touch_forwarded:
+                                # Inject complete MT state for all tracked
+                                # fingers so that fingers whose tracking IDs
+                                # were in previously-suppressed batches become
+                                # visible to libinput on the virtual device.
+                                for slot in sorted(slot_tid):
+                                    virt.write(ecodes.EV_ABS, ecodes.ABS_MT_SLOT, slot)
+                                    virt.write(
+                                        ecodes.EV_ABS,
+                                        ecodes.ABS_MT_TRACKING_ID,
+                                        slot_tid[slot],
+                                    )
+                                    if slot in slot_pos:
+                                        virt.write(
+                                            ecodes.EV_ABS,
+                                            ecodes.ABS_MT_POSITION_X,
+                                            slot_pos[slot][0],
+                                        )
+                                        virt.write(
+                                            ecodes.EV_ABS,
+                                            ecodes.ABS_MT_POSITION_Y,
+                                            slot_pos[slot][1],
+                                        )
+                                virt.write(ecodes.EV_KEY, ecodes.BTN_TOUCH, 1)
+                                clamped = max(0, min(total_count, 5))
+                                for i in range(1, 6):
+                                    virt.write(
+                                        ecodes.EV_KEY,
+                                        _BTN_TOOL_BY_COUNT[i],
+                                        1 if i == clamped else 0,
+                                    )
+                                virt.syn()
+                                touch_forwarded = True
+                                if args.verbose:
+                                    print(
+                                        f"  >> FORWARD START: {len(batch)} events, "
+                                        f"{total_count} fingers (state injected)"
+                                    )
                             for ev in batch:
                                 virt.write_event(ev)
                             virt.syn()
-                            if args.verbose and not touch_forwarded:
-                                print(
-                                    f"  >> FORWARD START: {len(batch)} events, "
-                                    f"{total_count} fingers"
-                                )
-                            touch_forwarded = True
                         elif touch_forwarded:
                             for ev in batch:
                                 virt.write_event(ev)
@@ -468,7 +511,8 @@ def main() -> None:
                                     print("  >> FORWARD END: all fingers lifted")
                         elif not no_slots:
                             if args.verbose:
-                                print("  [suppressed]")
+                                positions = {s: slot_pos.get(s, (0, 0)) for s in slot_dead}
+                                print(f"  [suppressed] {total_count} fingers: {positions}")
 
                         batch = []
                     else:
