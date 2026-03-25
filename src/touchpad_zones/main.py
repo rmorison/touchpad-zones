@@ -23,6 +23,7 @@ import select
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 import evdev
@@ -67,7 +68,7 @@ def create_virtual_device(real_dev: evdev.InputDevice) -> UInput:
     caps = real_dev.capabilities(absinfo=True)
     caps.pop(ecodes.EV_SYN, None)
     input_props = list(real_dev.input_props()) if hasattr(real_dev, "input_props") else []
-    return UInput(
+    virt = UInput(
         events=caps,
         name=f"{real_dev.name} (zone-filtered)",
         vendor=real_dev.info.vendor,
@@ -76,6 +77,20 @@ def create_virtual_device(real_dev: evdev.InputDevice) -> UInput:
         bustype=real_dev.info.bustype,
         input_props=input_props,
     )
+    # Initialize all MT slots with tracking_id=-1 (no touch).
+    # Without this, UInput defaults ABS values to 0, and
+    # ABS_MT_TRACKING_ID=0 means "finger present" — libinput sees a
+    # phantom touch at (0,0) and flags real events as "Touch jump".
+    abs_caps = dict(caps.get(ecodes.EV_ABS, []))
+    max_slots = 0
+    if ecodes.ABS_MT_SLOT in abs_caps:
+        info = abs_caps[ecodes.ABS_MT_SLOT]
+        max_slots = info.max if hasattr(info, "max") else info[1]
+    for slot in range(max_slots + 1):
+        virt.write(ecodes.EV_ABS, ecodes.ABS_MT_SLOT, slot)
+        virt.write(ecodes.EV_ABS, ecodes.ABS_MT_TRACKING_ID, -1)
+    virt.syn()
+    return virt
 
 
 def xinput_set_prop(device_name: str, prop: str, value: str) -> None:
@@ -110,22 +125,6 @@ def xinput_disable(device_name: str) -> None:
         print(f"Disabled {device_name} in X (xinput id {xid})")
     except Exception as e:
         print(f"Warning: could not disable {device_name}: {e}")
-
-
-def xinput_toggle(device_name: str) -> None:
-    """Disable then re-enable a device in X to force re-read."""
-    try:
-        xid = subprocess.check_output(
-            ["xinput", "list", "--id-only", device_name],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip()
-        subprocess.run(["xinput", "disable", xid], check=True, capture_output=True)
-        time.sleep(0.3)
-        subprocess.run(["xinput", "enable", xid], check=True, capture_output=True)
-        print(f"Toggled {device_name} in X (xinput id {xid})")
-    except Exception as e:
-        print(f"Warning: could not toggle {device_name}: {e}")
 
 
 # Modifier and function keys that should NOT trigger DWT
@@ -287,10 +286,50 @@ def main() -> None:
     # DWT state
     last_key_time = 0.0
 
-    # Idle-wake: toggle xinput after gaps (lock screen, suspend)
-    # CLOCK_BOOTTIME counts suspend time unlike monotonic
-    last_touch_time = 0.0
-    IDLE_THRESHOLD = 30.0  # seconds
+    # Session unlock / resume detection via D-Bus
+    needs_toggle = threading.Event()
+
+    def monitor_screensaver() -> None:
+        """Watch for GNOME ScreenSaver deactivation signal."""
+        try:
+            proc = subprocess.Popen(
+                [
+                    "dbus-monitor",
+                    "--session",
+                    "type='signal',interface='org.gnome.ScreenSaver',member='ActiveChanged'",
+                ],
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            for line in proc.stdout:  # type: ignore[union-attr]
+                # Signal emits "boolean true" (locked) / "boolean false" (unlocked)
+                if "boolean false" in line:
+                    needs_toggle.set()
+        except Exception as e:
+            print(f"Warning: screensaver monitor failed: {e}")
+
+    def monitor_sleep() -> None:
+        """Watch for systemd-logind PrepareForSleep(false) = resume from suspend."""
+        try:
+            proc = subprocess.Popen(
+                [
+                    "dbus-monitor",
+                    "--system",
+                    "type='signal',interface='org.freedesktop.login1.Manager',"
+                    "member='PrepareForSleep'",
+                ],
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            for line in proc.stdout:  # type: ignore[union-attr]
+                if "boolean false" in line:
+                    needs_toggle.set()
+        except Exception as e:
+            print(f"Warning: sleep monitor failed: {e}")
+
+    threading.Thread(target=monitor_screensaver, daemon=True).start()
+    threading.Thread(target=monitor_sleep, daemon=True).start()
+    print("Monitoring D-Bus for screen unlock / resume events")
 
     def is_typing() -> bool:
         return (time.monotonic() - last_key_time) < args.dwt_timeout
@@ -321,13 +360,13 @@ def main() -> None:
         print("\nClean shutdown.")
         sys.exit(0)
 
-    def toggle_virt(*_args: object) -> None:
-        xinput_toggle(virt.name)
-        print("SIGUSR1: toggled virtual device")
+    def recreate_virt(*_args: object) -> None:
+        needs_toggle.set()
+        print("SIGUSR1: virtual device recreation requested")
 
     signal.signal(signal.SIGTERM, cleanup)
     signal.signal(signal.SIGINT, cleanup)
-    signal.signal(signal.SIGUSR1, toggle_virt)
+    signal.signal(signal.SIGUSR1, recreate_virt)
 
     pid_file = os.path.expanduser("~/.touchpad-zones.pid")
     with open(pid_file, "w") as f:
@@ -427,20 +466,28 @@ def main() -> None:
                         any_active = any(not d for d in slot_dead.values())
                         no_slots = len(slot_dead) == 0
 
-                        # Idle-wake: xinput toggle to force X to re-read
-                        # the virtual device after lock / suspend.
-                        # Synthetic lift cleans up stale virtual-device state
-                        # but we do NOT skip this batch — let the touch land.
-                        now = time.clock_gettime(time.CLOCK_BOOTTIME)
-                        idle_gap = now - last_touch_time if last_touch_time else 0
-                        if last_touch_time and idle_gap > IDLE_THRESHOLD:
+                        # Session unlock / resume: recreate the virtual
+                        # device so X discovers a fresh evdev node.
+                        # xinput toggle is not sufficient — X can
+                        # permanently lose the old device after lock.
+                        if needs_toggle.is_set():
+                            needs_toggle.clear()
                             if touch_forwarded:
                                 synthetic_lift()
-                                touch_forwarded = False
-                            xinput_toggle(virt.name)
-                            if args.verbose:
-                                print(f"  WAKE: toggled after {idle_gap:.0f}s idle")
-                        last_touch_time = now
+                            reset_all()
+                            batch = []
+                            old_virt = virt
+                            virt = create_virtual_device(dev)
+                            with contextlib.suppress(Exception):
+                                old_virt.close()
+                            time.sleep(0.5)
+                            xinput_set_prop(
+                                virt.name,
+                                "libinput Disable While Typing Enabled",
+                                "0",
+                            )
+                            print(f"WAKE: recreated virtual device ({virt.device.path})")
+                            continue
 
                         # DWT: suppress everything during typing
                         if is_typing() and not touch_forwarded:
