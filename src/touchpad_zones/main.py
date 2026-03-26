@@ -40,6 +40,24 @@ _BTN_TOOL_BY_COUNT = [
 ]
 _BTN_TOOL_SET = set(_BTN_TOOL_BY_COUNT[1:])
 
+# ABS codes that are per-slot (MT protocol B) and must be filtered
+# when hiding dead-zone fingers from libinput.
+_MT_PER_SLOT_CODES = {
+    ecodes.ABS_MT_SLOT,
+    ecodes.ABS_MT_TRACKING_ID,
+    ecodes.ABS_MT_POSITION_X,
+    ecodes.ABS_MT_POSITION_Y,
+    ecodes.ABS_MT_PRESSURE,
+    ecodes.ABS_MT_TOUCH_MAJOR,
+    ecodes.ABS_MT_TOUCH_MINOR,
+    ecodes.ABS_MT_ORIENTATION,
+    ecodes.ABS_MT_DISTANCE,
+    ecodes.ABS_MT_TOOL_TYPE,
+    ecodes.ABS_MT_BLOB_ID,
+    ecodes.ABS_MT_TOOL_X,
+    ecodes.ABS_MT_TOOL_Y,
+}
+
 
 def find_touchpad() -> str | None:
     for path in evdev.list_devices():
@@ -281,6 +299,7 @@ def main() -> None:
     slot_tid: dict[int, int] = {}  # slot -> real tracking ID
     current_slot = 0
     touch_forwarded = False
+    virt_slots: set[int] = set()  # slots currently exposed to virtual device
     batch: list[evdev.InputEvent] = []
 
     # DWT state
@@ -339,6 +358,7 @@ def main() -> None:
         slot_pos.clear()
         slot_dead.clear()
         slot_tid.clear()
+        virt_slots.clear()
         current_slot = 0
         touch_forwarded = False
 
@@ -352,7 +372,13 @@ def main() -> None:
             virt.write(ecodes.EV_KEY, code, 0)
         virt.syn()
 
+    _shutting_down = False
+
     def cleanup(*_args: object) -> None:
+        nonlocal _shutting_down
+        if _shutting_down:
+            return
+        _shutting_down = True
         with contextlib.suppress(Exception):
             dev.ungrab()
         with contextlib.suppress(Exception):
@@ -504,15 +530,75 @@ def main() -> None:
                             current_slot = 0
                             continue
 
-                        total_count = len(slot_dead)
+                        active_slots = {s for s, d in slot_dead.items() if not d}
+                        active_count = len(active_slots)
+
+                        def filter_batch(
+                            batch: list[evdev.InputEvent],
+                            allowed: set[int],
+                            batch_slot: int = current_slot,
+                        ) -> list[evdev.InputEvent]:
+                            """Keep only MT events for allowed slots; strip BTN_TOOL_*.
+
+                            Also rewrites ABS_X/ABS_Y to match the first
+                            active slot so libinput doesn't see a position
+                            jump when the kernel's single-touch coords
+                            track a dead-zone finger.
+                            """
+                            # Find the first active slot's position for ABS_X/Y rewrite
+                            first_active = min(allowed) if allowed else None
+                            first_pos = (
+                                slot_pos.get(first_active) if first_active is not None else None
+                            )
+
+                            out: list[evdev.InputEvent] = []
+                            cur = batch_slot
+                            for ev in batch:
+                                if ev.type == ecodes.EV_ABS and ev.code == ecodes.ABS_MT_SLOT:
+                                    cur = ev.value
+                                if (
+                                    ev.type == ecodes.EV_ABS
+                                    and ev.code in _MT_PER_SLOT_CODES
+                                    and cur not in allowed
+                                ):
+                                    continue
+                                if ev.type == ecodes.EV_KEY and ev.code in _BTN_TOOL_SET:
+                                    continue
+                                # Rewrite single-touch ABS_X/ABS_Y to first active slot
+                                if (
+                                    first_pos
+                                    and ev.type == ecodes.EV_ABS
+                                    and ev.code == ecodes.ABS_X
+                                ):
+                                    out.append(
+                                        evdev.InputEvent(
+                                            ev.sec, ev.usec, ev.type, ev.code, first_pos[0]
+                                        )
+                                    )
+                                    continue
+                                if (
+                                    first_pos
+                                    and ev.type == ecodes.EV_ABS
+                                    and ev.code == ecodes.ABS_Y
+                                ):
+                                    out.append(
+                                        evdev.InputEvent(
+                                            ev.sec, ev.usec, ev.type, ev.code, first_pos[1]
+                                        )
+                                    )
+                                    continue
+                                out.append(ev)
+                            return out
 
                         if any_active:
                             if not touch_forwarded:
-                                # Inject complete MT state for all tracked
-                                # fingers so that fingers whose tracking IDs
-                                # were in previously-suppressed batches become
-                                # visible to libinput on the virtual device.
-                                for slot in sorted(slot_tid):
+                                # Inject complete MT state for active-zone
+                                # fingers only — dead-zone fingers are hidden
+                                # from libinput to prevent phantom multi-finger
+                                # gesture detection.
+                                for slot in sorted(active_slots):
+                                    if slot not in slot_tid:
+                                        continue
                                     virt.write(ecodes.EV_ABS, ecodes.ABS_MT_SLOT, slot)
                                     virt.write(
                                         ecodes.EV_ABS,
@@ -531,7 +617,7 @@ def main() -> None:
                                             slot_pos[slot][1],
                                         )
                                 virt.write(ecodes.EV_KEY, ecodes.BTN_TOUCH, 1)
-                                clamped = max(0, min(total_count, 5))
+                                clamped = max(0, min(active_count, 5))
                                 for i in range(1, 6):
                                     virt.write(
                                         ecodes.EV_KEY,
@@ -540,26 +626,33 @@ def main() -> None:
                                     )
                                 virt.syn()
                                 touch_forwarded = True
+                                virt_slots.update(active_slots)
                                 if args.verbose:
                                     print(
                                         f"  >> FORWARD START: {len(batch)} events, "
-                                        f"{total_count} fingers (state injected)"
+                                        f"{active_count} fingers (state injected)"
                                     )
-                            for ev in batch:
+                            virt_slots.update(active_slots)
+                            filtered = filter_batch(batch, virt_slots)
+                            for ev in rewrite_btn_tool(filtered, active_count):
                                 virt.write_event(ev)
                             virt.syn()
                         elif touch_forwarded:
-                            for ev in batch:
+                            # Active fingers lifted — forward their lifts
+                            # but suppress any lingering dead-zone slots.
+                            filtered = filter_batch(batch, virt_slots)
+                            for ev in rewrite_btn_tool(filtered, active_count):
                                 virt.write_event(ev)
                             virt.syn()
                             if no_slots:
                                 touch_forwarded = False
+                                virt_slots.clear()
                                 if args.verbose:
                                     print("  >> FORWARD END: all fingers lifted")
                         elif not no_slots:
                             if args.verbose:
                                 positions = {s: slot_pos.get(s, (0, 0)) for s in slot_dead}
-                                print(f"  [suppressed] {total_count} fingers: {positions}")
+                                print(f"  [suppressed] {len(slot_dead)} fingers: {positions}")
 
                         batch = []
                     else:
