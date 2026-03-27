@@ -95,10 +95,12 @@ def create_virtual_device(real_dev: evdev.InputDevice) -> UInput:
         bustype=real_dev.info.bustype,
         input_props=input_props,
     )
-    # Initialize all MT slots with tracking_id=-1 (no touch).
-    # Without this, UInput defaults ABS values to 0, and
-    # ABS_MT_TRACKING_ID=0 means "finger present" — libinput sees a
-    # phantom touch at (0,0) and flags real events as "Touch jump".
+    # Initialize device state so libinput doesn't see phantoms:
+    # 1. All MT slots get tracking_id=-1 (no touch) — otherwise
+    #    ABS_MT_TRACKING_ID defaults to 0 which means "finger present".
+    # 2. ABS_X/ABS_Y set to range midpoints — otherwise they default
+    #    to 0, and the first real touch triggers a "Touch jump" in
+    #    libinput (huge distance from 0,0 to actual position).
     abs_caps = dict(caps.get(ecodes.EV_ABS, []))
     max_slots = 0
     if ecodes.ABS_MT_SLOT in abs_caps:
@@ -107,6 +109,13 @@ def create_virtual_device(real_dev: evdev.InputDevice) -> UInput:
     for slot in range(max_slots + 1):
         virt.write(ecodes.EV_ABS, ecodes.ABS_MT_SLOT, slot)
         virt.write(ecodes.EV_ABS, ecodes.ABS_MT_TRACKING_ID, -1)
+    # Set single-touch coords to midpoint to avoid jump on first touch
+    for code in (ecodes.ABS_X, ecodes.ABS_Y):
+        if code in abs_caps:
+            ai = abs_caps[code]
+            lo = ai.min if hasattr(ai, "min") else ai[0]
+            hi = ai.max if hasattr(ai, "max") else ai[1]
+            virt.write(ecodes.EV_ABS, code, (lo + hi) // 2)
     virt.syn()
     return virt
 
